@@ -1,11 +1,12 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
+import { detectFirstFace } from "@/lib/faceDetector";
 
 type TabId = "mosaic" | "background-change" | "pose-change" | "image-to-video";
 
 export default function Home() {
-  const [tab, setTab] = useState<TabId>("mosaic");
+  const [tab, setTab] = useState<TabId>("image-to-video");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const [imageUrl, setImageUrl] = useState("");
@@ -15,17 +16,17 @@ export default function Home() {
   const [bgStrength, setBgStrength] = useState("medium");
   const [mosaicStrength, setMosaicStrength] = useState("2");
   const [mosaicArea, setMosaicArea] = useState("顔全体");
+  const [mosaicMode, setMosaicMode] = useState("モザイク");
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("待機中");
   const [resultUrl, setResultUrl] = useState("");
   const [log, setLog] = useState<string[]>([]);
-
-  const falImageInput = imageUrl.trim();
+  const [progress, setProgress] = useState(0);
+  const [progressLabel, setProgressLabel] = useState("待機中");
+  const progressTimerRef = useRef<number | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const tabs: { id: TabId; label: string }[] = [
-    { id: "mosaic", label: "顔モザイク" },
-    { id: "background-change", label: "背景変更" },
-    { id: "pose-change", label: "ポーズ変更" },
     { id: "image-to-video", label: "画像→動画" },
   ];
 
@@ -36,6 +37,7 @@ export default function Home() {
           file: selectedFile?.name ?? null,
           strength: mosaicStrength,
           area: mosaicArea,
+          mode: mosaicMode,
         },
         null,
         2
@@ -46,9 +48,8 @@ export default function Home() {
       return JSON.stringify(
         {
           file: selectedFile?.name ?? null,
-          imageUrl: falImageInput || null,
-          prompt:
-            prompt || "luxury hotel room, warm ambient lighting, elegant interior",
+          imageUrl: imageUrl || null,
+          prompt: prompt || "luxury hotel room, warm ambient lighting, elegant interior",
           strength: bgStrength,
         },
         null,
@@ -60,7 +61,7 @@ export default function Home() {
       return JSON.stringify(
         {
           file: selectedFile?.name ?? null,
-          imageUrl: falImageInput || null,
+          imageUrl: imageUrl || null,
           prompt:
             prompt ||
             "Change only the pose to an elegant standing pose. Keep the same person, face, hairstyle, outfit, and background as consistent as possible.",
@@ -73,7 +74,7 @@ export default function Home() {
     return JSON.stringify(
       {
         file: selectedFile?.name ?? null,
-        imageUrl: falImageInput || null,
+        imageUrl: imageUrl || null,
         prompt: prompt || "subtle natural motion, cinematic, realistic",
         duration,
         aspectRatio,
@@ -81,12 +82,60 @@ export default function Home() {
       null,
       2
     );
-  }, [tab, selectedFile, mosaicStrength, mosaicArea, falImageInput, prompt, bgStrength, duration, aspectRatio]);
+  }, [tab, selectedFile, mosaicStrength, mosaicArea, mosaicMode, imageUrl, prompt, bgStrength, duration, aspectRatio]);
+
+  const stopProgress = () => {
+    if (progressTimerRef.current) {
+      window.clearInterval(progressTimerRef.current);
+      progressTimerRef.current = null;
+    }
+  };
+
+  const startProgress = (label = "処理中") => {
+    stopProgress();
+    setProgress(18);
+    setProgressLabel(label);
+
+    progressTimerRef.current = window.setInterval(() => {
+      setProgress((prev) => {
+        if (prev >= 92) return prev;
+        if (prev < 40) return prev + 8;
+        if (prev < 70) return prev + 4;
+        if (prev < 85) return prev + 2;
+        return prev + 1;
+      });
+    }, 500);
+  };
+
+  const finishProgress = (label = "完了") => {
+    stopProgress();
+    setProgress(100);
+    setProgressLabel(label);
+  };
+
+  const failProgress = (label = "エラー") => {
+    stopProgress();
+    setProgress(0);
+    setProgressLabel(label);
+  };
+
+  const cancelProcessing = () => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    stopProgress();
+    setLoading(false);
+    setStatus("キャンセルしました");
+    setProgress(0);
+    setProgressLabel("キャンセルしました");
+    setLog((prev) => [...prev, "キャンセル"]);
+  };
 
   const resetResult = () => {
     setResultUrl("");
     setLog([]);
     setStatus("待機中");
+    setProgress(0);
+    setProgressLabel("待機中");
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -106,6 +155,17 @@ export default function Home() {
     }
   };
 
+  const handleDownload = () => {
+    if (!resultUrl) return;
+    const a = document.createElement("a");
+    a.href = resultUrl;
+    const ext = tab === "image-to-video" ? "mp4" : "png";
+    a.download = `${tab}-${Date.now()}.${ext}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+
   const runMosaic = async () => {
     if (!selectedFile) {
       alert("画像を選択してください");
@@ -113,100 +173,127 @@ export default function Home() {
     }
 
     const formData = new FormData();
+
+    const faceBox = await detectFirstFace(selectedFile);
+    if (!faceBox) {
+      alert("顔を検出できませんでした");
+      return;
+    }
+
+    const padX = Math.round(faceBox.width * 0.06);
+    const padY = Math.round(faceBox.height * 0.08);
+    const x = Math.max(0, faceBox.x - padX);
+    const y = Math.max(0, faceBox.y - padY);
+    const width = faceBox.width + padX * 2;
+    const height = Math.round(faceBox.height + padY * 1.4);
     formData.append("file", selectedFile);
+    formData.append("x", String(x));
+    formData.append("y", String(y));
+    formData.append("width", String(width));
+    formData.append("height", String(height));
+    formData.append("mode", mosaicMode);
     formData.append("strength", mosaicStrength);
     formData.append("area", mosaicArea);
 
     setLoading(true);
+    startProgress("顔処理を実行中");
     setStatus("モザイク処理中");
     setLog(["POST /api/mosaic"]);
 
     try {
-      const res = await fetch("/api/mosaic", {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text || "mosaic failed");
-      }
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+      const res = await fetch("/api/mosaic", { method: "POST", body: formData, signal: controller.signal });
+      if (!res.ok) throw new Error(await res.text());
 
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       setResultUrl(url);
       setStatus("完了");
+      finishProgress("完了");
       setLog((prev) => [...prev, "モザイク処理完了"]);
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        setStatus("キャンセルしました");
+        failProgress("キャンセルしました");
+        return;
+      }
       const message = error instanceof Error ? error.message : "mosaic failed";
-      console.error(error);
       setStatus("エラー");
+      failProgress("エラー");
       setLog((prev) => [...prev, message]);
       alert(message);
     } finally {
+      abortControllerRef.current = null;
       setLoading(false);
     }
   };
 
   const runFalApi = async (endpoint: string, extra: Record<string, string | number>) => {
-    if (!selectedFile && !falImageInput) {
+    if (!selectedFile && !imageUrl.trim()) {
       alert("画像を選択するか、元画像URLを入力してください");
       return;
     }
 
     setLoading(true);
+
+    const progressText =
+      endpoint === "/api/background-change"
+        ? "背景変更を実行中"
+        : endpoint === "/api/pose-change"
+          ? "ポーズ変更を実行中"
+          : endpoint === "/api/image-to-video"
+            ? "動画生成を実行中"
+            : "処理中";
+
+    startProgress(progressText);
     setStatus("API実行中");
     setLog([`POST ${endpoint}`]);
 
     try {
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
       let res: Response;
 
       if (selectedFile) {
         const formData = new FormData();
         formData.append("file", selectedFile);
-        Object.entries(extra).forEach(([key, value]) => {
-          formData.append(key, String(value));
-        });
-
-        res = await fetch(endpoint, {
-          method: "POST",
-          body: formData,
-        });
+        Object.entries(extra).forEach(([key, value]) => formData.append(key, String(value)));
+        res = await fetch(endpoint, { method: "POST", body: formData, signal: controller.signal });
       } else {
         res = await fetch(endpoint, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            imageUrl: falImageInput,
-            ...extra,
-          }),
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ imageUrl: imageUrl.trim(), ...extra }),
+          signal: controller.signal,
         });
       }
 
       const data = await res.json().catch(() => ({}));
-
-      if (!res.ok) {
-        throw new Error(data?.error || JSON.stringify(data) || "request failed");
-      }
+      if (!res.ok) throw new Error(data?.error || "request failed");
 
       const outputUrl = data.imageUrl || data.videoUrl || "";
       setResultUrl(outputUrl);
       setStatus("完了");
+      finishProgress("完了");
       setLog((prev) => [
         ...prev,
         `requestId: ${data.requestId ?? "-"}`,
-        data.uploadedImageUrl ? `uploaded: ${data.uploadedImageUrl}` : "uploaded: -",
         outputUrl ? `result: ${outputUrl}` : "resultなし",
       ]);
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        setStatus("キャンセルしました");
+        failProgress("キャンセルしました");
+        return;
+      }
       const message = error instanceof Error ? error.message : "request failed";
-      console.error(error);
       setStatus("エラー");
+      failProgress("エラー");
       setLog((prev) => [...prev, message]);
       alert(message);
     } finally {
+      abortControllerRef.current = null;
       setLoading(false);
     }
   };
@@ -214,29 +301,21 @@ export default function Home() {
   const handleRun = async () => {
     resetResult();
 
-    if (tab === "mosaic") {
-      await runMosaic();
-      return;
-    }
-
+    if (tab === "mosaic") return runMosaic();
     if (tab === "background-change") {
-      await runFalApi("/api/background-change", {
+      return runFalApi("/api/background-change", {
         prompt: prompt || "luxury hotel room, warm ambient lighting, elegant interior",
         strength: bgStrength,
       });
-      return;
     }
-
     if (tab === "pose-change") {
-      await runFalApi("/api/pose-change", {
+      return runFalApi("/api/pose-change", {
         prompt:
           prompt ||
           "Change only the pose to an elegant standing pose. Keep the same person, face, hairstyle, outfit, and background as consistent as possible.",
       });
-      return;
     }
-
-    await runFalApi("/api/image-to-video", {
+    return runFalApi("/api/image-to-video", {
       prompt: prompt || "subtle natural motion, cinematic, realistic",
       duration: Number(duration),
       aspectRatio,
@@ -250,12 +329,7 @@ export default function Home() {
           <div className="mb-3 inline-flex rounded-full border border-white/15 px-3 py-1 text-xs text-white/80">
             AIveil LAB
           </div>
-          <h1 className="text-3xl font-semibold tracking-tight md:text-4xl">
-            画像加工・動画化検証アプリ
-          </h1>
-          <p className="mt-3 max-w-3xl text-sm leading-6 text-white/75 md:text-base">
-            fal系もローカル画像選択で実行できるようにした版です。
-          </p>
+          <h1 className="text-3xl font-semibold tracking-tight md:text-4xl">画像加工・動画化検証アプリ</h1>
         </div>
 
         <div className="mb-6 flex flex-wrap gap-3">
@@ -267,9 +341,7 @@ export default function Home() {
                 resetResult();
               }}
               className={`rounded-xl px-4 py-2 text-sm font-medium transition ${
-                tab === item.id
-                  ? "bg-zinc-900 text-white"
-                  : "border border-zinc-200 bg-white text-zinc-700"
+                tab === item.id ? "bg-zinc-900 text-white" : "border border-zinc-200 bg-white text-zinc-700"
               }`}
             >
               {item.label}
@@ -277,24 +349,26 @@ export default function Home() {
           ))}
         </div>
 
+        <div className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          現在ご案内中の機能は「画像→動画」です。他機能は調整中です。
+        </div>
+
         <div className="grid gap-6 lg:grid-cols-[0.95fr_1.05fr]">
           <section className="space-y-6">
             <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
-              <div className="mb-4 text-sm font-semibold uppercase tracking-wide text-zinc-500">
-                入力
-              </div>
+              <div className="mb-4 text-sm font-semibold uppercase tracking-wide text-zinc-500">入力</div>
 
               <div className="space-y-4">
                 <div>
                   <label className="mb-2 block text-sm font-medium">画像選択</label>
-                  <input
-                    type="file"
-                    accept="image/*"
-                    onChange={handleFileChange}
-                    className="block w-full rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm"
-                  />
-                  <div className="mt-2 text-sm text-zinc-500">
-                    {selectedFile ? `選択中: ${selectedFile.name}` : "未選択"}
+                  <div className="flex flex-wrap items-center gap-3">
+                    <label className="inline-flex cursor-pointer items-center rounded-xl bg-zinc-900 px-4 py-3 text-sm font-medium text-white hover:bg-zinc-800">
+                      画像を選択
+                      <input type="file" accept="image/*" onChange={handleFileChange} className="hidden" />
+                    </label>
+                    <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-3 text-sm text-zinc-500">
+                      {selectedFile ? `選択中: ${selectedFile.name}` : "未選択"}
+                    </div>
                   </div>
                 </div>
 
@@ -306,9 +380,6 @@ export default function Home() {
                     placeholder="https://example.com/source.jpg"
                     className="w-full rounded-xl border border-zinc-200 px-4 py-3 text-sm"
                   />
-                  <div className="mt-2 text-xs text-zinc-500">
-                    URL未入力でも、画像選択済みなら fal 系 API を実行します
-                  </div>
                 </div>
 
                 {tab !== "mosaic" && (
@@ -317,20 +388,13 @@ export default function Home() {
                     <textarea
                       value={prompt}
                       onChange={(e) => setPrompt(e.target.value)}
-                      placeholder={
-                        tab === "background-change"
-                          ? "例: luxury hotel room, warm ambient lighting, elegant interior"
-                          : tab === "pose-change"
-                          ? "例: Change only the pose to a seated pose. Keep the same person, face, hairstyle, outfit, and background as consistent as possible."
-                          : "例: subtle natural motion, cinematic, realistic"
-                      }
                       className="min-h-32 w-full rounded-xl border border-zinc-200 px-4 py-3 text-sm"
                     />
                   </div>
                 )}
 
                 {tab === "mosaic" && (
-                  <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="grid gap-4 sm:grid-cols-3">
                     <div>
                       <label className="mb-2 block text-sm font-medium">モザイク強度</label>
                       <select
@@ -356,6 +420,18 @@ export default function Home() {
                         <option>口元のみ</option>
                       </select>
                     </div>
+                    <div>
+                      <label className="mb-2 block text-sm font-medium">処理方式</label>
+                      <select
+                        value={mosaicMode}
+                        onChange={(e) => setMosaicMode(e.target.value)}
+                        className="w-full rounded-xl border border-zinc-200 px-4 py-3 text-sm"
+                      >
+                        <option>モザイク</option>
+                        <option>ブラー</option>
+                        <option>ガウス</option>
+                      </select>
+                    </div>
                   </div>
                 )}
 
@@ -369,9 +445,7 @@ export default function Home() {
                           type="button"
                           onClick={() => setBgStrength(value)}
                           className={`rounded-xl px-4 py-2 text-sm font-medium ${
-                            bgStrength === value
-                              ? "bg-zinc-900 text-white"
-                              : "border border-zinc-200 bg-white text-zinc-700"
+                            bgStrength === value ? "bg-zinc-900 text-white" : "border border-zinc-200 bg-white text-zinc-700"
                           }`}
                         >
                           {value}
@@ -409,23 +483,19 @@ export default function Home() {
                   </div>
                 )}
 
-                <div className="flex gap-3">
-                  <button
-                    type="button"
-                    onClick={handleRun}
-                    disabled={loading}
-                    className="rounded-xl bg-zinc-900 px-4 py-2 text-sm font-medium text-white disabled:bg-zinc-400"
-                  >
-                    {loading ? "実行中" : "実行"}
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  onClick={handleRun}
+                  disabled={loading}
+                  className="rounded-xl bg-zinc-900 px-4 py-2 text-sm font-medium text-white disabled:bg-zinc-400"
+                >
+                  {loading ? "実行中" : "実行"}
+                </button>
               </div>
             </div>
 
             <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
-              <div className="mb-4 text-sm font-semibold uppercase tracking-wide text-zinc-500">
-                Payload preview
-              </div>
+              <div className="mb-4 text-sm font-semibold uppercase tracking-wide text-zinc-500">送信内容の確認</div>
               <pre className="overflow-x-auto rounded-2xl bg-zinc-950 p-4 text-xs leading-6 text-zinc-300">
                 {payloadPreview}
               </pre>
@@ -435,82 +505,71 @@ export default function Home() {
           <section className="space-y-6">
             <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
               <div className="mb-4 flex items-center justify-between">
-                <div>
-                  <div className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
-                    プレビュー
-                  </div>
-                  <h2 className="mt-1 text-xl font-semibold">結果確認</h2>
-                </div>
-                <div className="rounded-full bg-zinc-100 px-3 py-1 text-xs font-medium text-zinc-700">
-                  {status}
-                </div>
+                <h2 className="text-xl font-semibold">結果確認</h2>
+                <div className="rounded-full bg-zinc-100 px-3 py-1 text-xs font-medium text-zinc-700">{status}</div>
               </div>
 
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="overflow-hidden rounded-2xl border border-zinc-200 bg-zinc-100">
                   {previewUrl ? (
-                    <img
-                      src={previewUrl}
-                      alt="input"
-                      className="aspect-[3/4] w-full object-cover"
-                    />
+                    <img src={previewUrl} alt="input" className="aspect-[3/4] w-full object-cover" />
                   ) : (
                     <div className="aspect-[3/4] w-full bg-[linear-gradient(135deg,#d4d4d8,#f4f4f5)]" />
                   )}
-                  <div className="border-t border-zinc-200 px-4 py-3 text-sm text-zinc-600">
-                    input
-                  </div>
+                  <div className="border-t border-zinc-200 px-4 py-3 text-sm text-zinc-600">元画像</div>
                 </div>
 
                 <div className="overflow-hidden rounded-2xl border border-zinc-200 bg-zinc-100">
                   {resultUrl ? (
                     tab === "image-to-video" ? (
-                      <video
-                        src={resultUrl}
-                        controls
-                        className="aspect-video w-full bg-black object-contain"
-                      />
+                      <video src={resultUrl} controls className="aspect-video w-full bg-black object-contain" />
                     ) : (
-                      <img
-                        src={resultUrl}
-                        alt="output"
-                        className="aspect-[3/4] w-full object-cover"
-                      />
+                      <img src={resultUrl} alt="output" className="aspect-[3/4] w-full object-cover" />
                     )
                   ) : (
-                    <div
-                      className={`w-full ${
-                        tab === "image-to-video"
-                          ? "aspect-video bg-[radial-gradient(circle_at_top_left,#d4d4d8,transparent_35%),linear-gradient(135deg,#18181b,#3f3f46)]"
-                          : "aspect-[3/4] bg-[linear-gradient(135deg,#e4d4b7,#faf7f0)]"
-                      }`}
-                    />
+                    <div className="aspect-[3/4] w-full bg-[linear-gradient(135deg,#e4d4b7,#faf7f0)]" />
                   )}
-                  <div className="border-t border-zinc-200 px-4 py-3 text-sm text-zinc-600">
-                    output
-                  </div>
+                  <div className="border-t border-zinc-200 px-4 py-3 text-sm text-zinc-600">処理結果</div>
                 </div>
               </div>
+
+              {resultUrl && (
+                <div className="mt-4 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={handleDownload}
+                    className="rounded-xl bg-zinc-900 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-800"
+                  >
+                    ダウンロード
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
-              <div className="mb-4 text-sm font-semibold uppercase tracking-wide text-zinc-500">
-                Log
-              </div>
+              <div className="mb-4 text-sm font-semibold uppercase tracking-wide text-zinc-500">進行状況</div>
               <div className="space-y-3">
-                {log.length === 0 ? (
-                  <div className="rounded-xl bg-zinc-50 px-4 py-3 text-sm text-zinc-500">
-                    まだ実行していません
-                  </div>
-                ) : (
-                  log.map((item, index) => (
-                    <div
-                      key={`${item}-${index}`}
-                      className="rounded-xl bg-zinc-50 px-4 py-3 text-sm text-zinc-700"
+                <div className="mb-2 flex items-center justify-between text-sm">
+                  <span className="text-zinc-700">{progressLabel}</span>
+                  <span className="text-zinc-500">{progress}%</span>
+                </div>
+                <div className="h-3 w-full overflow-hidden rounded-full bg-zinc-100">
+                  <div
+                    className="h-full rounded-full bg-zinc-900 transition-all duration-300"
+                    style={{ width: `${progress}%` }}
+                  />
+                </div>
+
+                {loading && (
+                  <div className="mt-4 flex justify-end">
+                    <button
+                      type="button"
+                      onClick={cancelProcessing}
+                      className="rounded-xl border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-50"
                     >
-                      {item}
-                    </div>
-                  ))
+                      キャンセル
+                    </button>
+                  </div>
                 )}
               </div>
             </div>

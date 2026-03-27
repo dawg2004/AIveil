@@ -7,17 +7,32 @@ export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
     const file = formData.get("file") as File | null;
-    const strength = Number(formData.get("strength") ?? 2);
-    const area = String(formData.get("area") ?? "顔全体");
+    const mode = String(formData.get("mode") ?? "モザイク");
+
+    const x = Number(formData.get("x") ?? 0);
+    const y = Number(formData.get("y") ?? 0);
+    const width = Number(formData.get("width") ?? 0);
+    const height = Number(formData.get("height") ?? 0);
+
+    const rawStrength = String(formData.get("strength") ?? "2");
+    const strengthMap: Record<string, number> = {
+      "1": 1,
+      "2": 2,
+      "3": 3,
+      "4": 4,
+      "弱": 1,
+      "中": 2,
+      "強": 3,
+      "最強": 4,
+    };
+    const strength = strengthMap[rawStrength] ?? 2;
 
     if (!file) {
       return NextResponse.json({ error: "file is required" }, { status: 400 });
     }
 
     const bytes = Buffer.from(await file.arrayBuffer());
-    const image = sharp(bytes);
-    const meta = await image.metadata();
-
+    const meta = await sharp(bytes).metadata();
     const imgW = meta.width ?? 0;
     const imgH = meta.height ?? 0;
 
@@ -25,42 +40,83 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "invalid image" }, { status: 400 });
     }
 
-    let left = Math.floor(imgW * 0.35);
-    let top = Math.floor(imgH * 0.12);
-    let w = Math.floor(imgW * 0.30);
-    let h = Math.floor(imgH * 0.18);
+    const left = Math.max(0, Math.floor(x));
+    const top = Math.max(0, Math.floor(y));
+    const safeWidth = Math.max(1, Math.min(Math.floor(width), imgW - left));
+    const safeHeight = Math.max(1, Math.min(Math.floor(height), imgH - top));
 
-    if (area === "目元のみ") {
-      left = Math.floor(imgW * 0.38);
-      top = Math.floor(imgH * 0.15);
-      w = Math.floor(imgW * 0.24);
-      h = Math.floor(imgH * 0.06);
-    } else if (area === "口元のみ") {
-      left = Math.floor(imgW * 0.42);
-      top = Math.floor(imgH * 0.22);
-      w = Math.floor(imgW * 0.16);
-      h = Math.floor(imgH * 0.06);
+    let region: Buffer;
+
+    if (mode === "ブラー") {
+      const sigma = Math.max(2, strength * 4);
+      region = await sharp(bytes)
+        .extract({ left, top, width: safeWidth, height: safeHeight })
+        .blur(sigma)
+        .png()
+        .toBuffer();
+
+      const maskSvg = Buffer.from(`
+        <svg width="${safeWidth}" height="${safeHeight}">
+          <ellipse
+            cx="${safeWidth / 2}"
+            cy="${safeHeight / 2}"
+            rx="${safeWidth * 0.39}"
+            ry="${safeHeight * 0.45}"
+            fill="white"
+          />
+        </svg>
+      `);
+
+      region = await sharp(region)
+        .composite([{ input: maskSvg, blend: "dest-in" }])
+        .png()
+        .toBuffer();
+    } else if (mode === "ガウス") {
+      const sigma = Math.max(6, strength * 6);
+      region = await sharp(bytes)
+        .extract({ left, top, width: safeWidth, height: safeHeight })
+        .blur(sigma)
+        .png()
+        .toBuffer();
+
+      const maskSvg = Buffer.from(`
+        <svg width="${safeWidth}" height="${safeHeight}">
+          <ellipse
+            cx="${safeWidth / 2}"
+            cy="${safeHeight / 2}"
+            rx="${safeWidth * 0.39}"
+            ry="${safeHeight * 0.45}"
+            fill="white"
+          />
+        </svg>
+      `);
+
+      region = await sharp(region)
+        .composite([{ input: maskSvg, blend: "dest-in" }])
+        .png()
+        .toBuffer();
+    } else {
+      const block = Math.max(10, Math.floor(28 * strength));
+      const downW = Math.max(3, Math.floor(safeWidth / block));
+      const downH = Math.max(3, Math.floor(safeHeight / block));
+
+      region = await sharp(bytes)
+        .extract({ left, top, width: safeWidth, height: safeHeight })
+        .resize(downW, downH, { kernel: "nearest" })
+        .resize(safeWidth, safeHeight, { kernel: "nearest" })
+        .png()
+        .toBuffer();
     }
 
-    const downW = Math.max(8, Math.floor(w / (strength * 5)));
-    const downH = Math.max(8, Math.floor(h / (strength * 5)));
-
-    const mosaicRegion = await sharp(bytes)
-      .extract({ left, top, width: w, height: h })
-      .resize(downW, downH, { kernel: "nearest" })
-      .resize(w, h, { kernel: "nearest" })
-      .png()
-      .toBuffer();
-
     const output = await sharp(bytes)
-      .composite([{ input: mosaicRegion, left, top }])
+      .composite([{ input: region, left, top }])
       .png()
       .toBuffer();
 
     return new NextResponse(new Uint8Array(output), {
       headers: {
         "Content-Type": "image/png",
-        "Cache-Control": "no-store",
+        "Cache-Control": "no-store"
       },
     });
   } catch (error) {
